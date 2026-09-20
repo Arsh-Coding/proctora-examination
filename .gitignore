@@ -1,0 +1,12 @@
+node_modules
+dist
+.env
+.env.local
+*.log
+.DS_Store
+.idea
+.vscode/*
+!.vscode/extensions.json
+
+# Recorded demo videos (scripts/demo-video.mjs) — large binaries, regenerate instead
+demo/

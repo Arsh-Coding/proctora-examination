@@ -1,0 +1,29 @@
+{
+  "name": "proctora",
+  "version": "1.0.0",
+  "private": true,
+  "description": "PROCTORA - online exam platform with browser-based remote proctoring (React + TypeScript client, Express + TypeScript API)",
+  "scripts": {
+    "postinstall": "npm run install:all",
+    "install:all": "npm --prefix server install && npm --prefix client install",
+    "dev": "concurrently -k -n api,web -c blue,magenta \"npm:dev:server\" \"npm:dev:client\"",
+    "dev:server": "npm --prefix server run dev",
+    "dev:client": "npm --prefix client run dev",
+    "build": "npm --prefix server run build && npm --prefix client run build",
+    "start": "npm --prefix server run start",
+    "seed": "npm --prefix server run seed",
+    "seed:reset": "npm --prefix server run seed -- --reset",
+    "typecheck": "npm --prefix server run typecheck && npm --prefix client run typecheck",
+    "test:api": "node server/scripts/smoke.mjs",
+    "test:realtime": "node server/scripts/realtime.mjs",
+    "test:browser": "node scripts/browser-e2e.mjs",
+    "test:e2e": "npm run test:api && npm run test:realtime && npm run test:browser"
+  },
+  "devDependencies": {
+    "concurrently": "9.2.1",
+    "playwright": "^1.56.0"
+  },
+  "engines": {
+    "node": ">=20 <23"
+  }
+}

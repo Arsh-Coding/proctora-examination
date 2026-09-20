@@ -1,0 +1,34 @@
+# Render Blueprint for the PROCTORA API.
+#
+# The client is NOT deployed here (it goes to Vercel/Netlify), and the API cannot
+# go to Vercel: Socket.io needs a long-lived connection, which Vercel Functions
+# still drop after a few minutes.
+#
+# You can either point Render at this file (New > Blueprint) or create a Web
+# Service by hand with the same settings.
+
+services:
+  - type: web
+    name: proctora-api
+    runtime: node
+    plan: free
+    # Only the server/ subtree is built. The root package.json and its
+    # `concurrently` dev script are irrelevant in production.
+    rootDir: server
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # Generated once by Render and then kept. Changing it invalidates every
+      # issued admin token and in-flight exam session token.
+      - key: JWT_SECRET
+        generateValue: true
+      # Set these in the dashboard: they are environment specific.
+      #   MONGO_URI  -> your MongoDB Atlas SRV string
+      #   CLIENT_URL -> your deployed frontend origin, e.g. https://proctora.vercel.app
+      - key: MONGO_URI
+        sync: false
+      - key: CLIENT_URL
+        sync: false

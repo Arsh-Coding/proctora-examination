@@ -1,0 +1,28 @@
+node_modules
+dist
+dist-ssr
+*.local
+.env
+.env.local
+
+# Guard: src/ is TypeScript only. A misconfigured `tsc` can emit .js next to the
+# sources, and Vite resolves .js before .tsx for extensionless imports, so stale
+# output would silently shadow the real modules.
+src/**/*.js
+src/**/*.js.map
+*.tsbuildinfo
+
+# Copied out of node_modules by scripts/setup-face-model.mjs (~34 MB, so not
+# committed). Regenerated on every install and build from the pinned package.
+public/mediapipe/
+
+# NOTE: public/models/ is deliberately NOT ignored. The 224 KB face model is
+# committed so production builds never depend on a network fetch succeeding.
+
+logs
+*.log
+npm-debug.log*
+.DS_Store
+.vscode/*
+!.vscode/extensions.json
+.idea
