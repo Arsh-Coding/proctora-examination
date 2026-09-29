@@ -28,7 +28,7 @@
  *   DEMO_SPEED    pacing divisor, 1.5 = 1.5x faster   (default 1)
  *   DEMO_HEADFUL  set to "true" to watch the browser while it records
  */
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -39,15 +39,34 @@ import { openCandidate } from './demo/extra-candidate.mjs';
 import { installOverlay } from './demo/overlay.mjs';
 import { mixNarration } from './demo/mixdown.mjs';
 import { budget, demoSpeed, Stage, sleep } from './demo/stage.mjs';
-import { synthesizeCues } from './demo/voice.mjs';
+import { Narrator } from './demo/voice.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, '..');
 
-const WEB = process.env.WEB_BASE ?? 'http://localhost:5173';
-const API = process.env.API_BASE ?? 'http://localhost:5000';
-const OUT = process.env.DEMO_OUT ?? path.join(REPO, 'demo');
-const HEADFUL = process.env.DEMO_HEADFUL === 'true';
+/**
+ * Flags take precedence over environment variables, so a cut can be produced
+ * with a single command:
+ *   node scripts/demo-video.mjs --voice male --scale 1.0 --name proctora-demo-male
+ */
+function flag(name, fallback) {
+  const index = process.argv.indexOf(`--${name}`);
+  if (index >= 0 && process.argv[index + 1] && !process.argv[index + 1].startsWith('--')) {
+    return process.argv[index + 1];
+  }
+  return fallback;
+}
+
+const WEB = flag('web', process.env.WEB_BASE ?? 'http://localhost:5173');
+const API = flag('api', process.env.API_BASE ?? 'http://localhost:5000');
+const OUT = flag('out', process.env.DEMO_OUT ?? path.join(REPO, 'demo'));
+const HEADFUL = process.env.DEMO_HEADFUL === 'true' || process.argv.includes('--headful');
+/** "male", "female", or an installed voice name such as "Microsoft Mark". */
+const VOICE = flag('voice', process.env.DEMO_VOICE ?? 'female');
+/** SSML prosody multiplier. 1.0 is the voice's natural speed. */
+const VOICE_SCALE = Number(flag('scale', process.env.DEMO_VOICE_SCALE ?? 0.94));
+/** Base filename for this cut, so different voices do not overwrite each other. */
+const OUT_NAME = flag('name', process.env.DEMO_OUT_NAME ?? 'proctora-demo');
 
 const VIEW = { width: 1280, height: 720 };
 
@@ -106,6 +125,87 @@ const EXAM = {
 const CANDIDATE_PICKS = ['A', 'B', 'C', 'A'];
 
 const log = (...args) => console.log('·', ...args);
+
+/** Silence held after every spoken line. */
+const PAUSE_MS = Number(process.env.DEMO_VOICE_PAUSE ?? 550);
+
+/**
+ * Prints where the narration goes quiet. Long silences are what makes a
+ * walkthrough feel like it is stalling, so they are worth seeing as numbers
+ * rather than discovering on playback.
+ */
+function reportPacing(cues, totalMs, spokenMs) {
+  const ordered = [...cues].sort((a, b) => a.at - b.at);
+  const gaps = [];
+  let cursor = 0;
+  let after = '(start of film)';
+  for (const cue of ordered) {
+    if (cue.at - cursor > 0) gaps.push({ at: cursor, seconds: (cue.at - cursor) / 1000, after });
+    cursor = Math.max(cursor, cue.at + cue.durationMs);
+    after = cue.text ?? after;
+  }
+  if (totalMs - cursor > 0) gaps.push({ at: cursor, seconds: (totalMs - cursor) / 1000, after });
+
+  const clock = (ms) =>
+    `${Math.floor(ms / 60000)}:${String(Math.floor((ms % 60000) / 1000)).padStart(2, '0')}`;
+  const long = gaps.filter((gap) => gap.seconds >= 6).sort((a, b) => b.seconds - a.seconds);
+
+  console.log(
+    `\n Narration covers ${Math.round((spokenMs / totalMs) * 100)}% of ` +
+      `${clock(totalMs)} (${ordered.length} lines).`
+  );
+  if (long.length > 0) {
+    console.log(' Silent stretches over 6s:');
+    for (const gap of long.slice(0, 8)) {
+      console.log(
+        `   ${clock(gap.at).padStart(6)}  ${gap.seconds.toFixed(1).padStart(5)}s  ` +
+          `after: “${String(gap.after).slice(0, 62)}”`
+      );
+    }
+  }
+}
+
+/**
+ * Holds off idle sleep for the length of the recording.
+ *
+ * A run takes ten minutes or so with no keyboard or mouse activity, which is
+ * exactly what Windows treats as idle. If the machine suspends mid-take the
+ * video is ruined and the wall clock jumps, so a helper process keeps the
+ * request flag raised. `SetThreadExecutionState` is per-process and the flag
+ * lapses the moment that process exits, so nothing is left changed afterwards.
+ *
+ * @returns {() => void} release
+ */
+function keepAwake() {
+  const script = [
+    '$sig = @"',
+    '[DllImport("kernel32.dll", SetLastError=true)]',
+    'public static extern uint SetThreadExecutionState(uint esFlags);',
+    '"@',
+    'Add-Type -MemberDefinition $sig -Name Power -Namespace Win32 | Out-Null',
+    // ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
+    '[Win32.Power]::SetThreadExecutionState(0x80000000 -bor 0x00000001 -bor 0x00000002) | Out-Null',
+    'while ($true) { Start-Sleep -Seconds 30 }',
+  ].join('\n');
+
+  try {
+    const child = spawn('powershell.exe', ['-NoProfile', '-Command', script], {
+      stdio: 'ignore',
+      windowsHide: true,
+      detached: false,
+    });
+    child.unref();
+    return () => {
+      try {
+        child.kill();
+      } catch {
+        /* already gone */
+      }
+    };
+  } catch {
+    return () => {};
+  }
+}
 
 function run(exe, args) {
   const result = spawnSync(exe, args, { encoding: 'utf8', windowsHide: true });
@@ -205,6 +305,31 @@ async function preflight() {
 /* Scenes                                                                     */
 /* -------------------------------------------------------------------------- */
 
+async function sceneIntro(stage) {
+  await stage.cover(
+    {
+      brand: true,
+      badge: 'AS',
+      brandName: 'ARSHPREET SINGH',
+      kicker: 'Project walkthrough',
+      title: 'Hi, I’m Arshpreet.',
+      subtitle:
+        'Full-stack developer — Node.js, React and TypeScript. Associate Software Engineer.',
+      items: [
+        'I built PROCTORA: an online exam platform with remote proctoring built into the browser',
+        'React + TypeScript on the front end, Express + TypeScript and MongoDB behind it',
+        'Real-time delivery over Socket.io, and every detector runs on-device',
+      ],
+      footer: 'arshpreet.singh.dev@gmail.com',
+      voice:
+        "Hi, I'm Arshpreet Singh, a full-stack developer working with Node.js, React and TypeScript. " +
+        'I built PROCTORA, an online exam platform with remote proctoring built into the browser. ' +
+        'Let me show you how it works.',
+    },
+    1200
+  );
+}
+
 async function sceneTitle(stage) {
   await stage.cover(
     {
@@ -217,8 +342,12 @@ async function sceneTitle(stage) {
         'Marking, timing and storage are all server-side',
       ],
       footer: 'React + TypeScript · Express + TypeScript · MongoDB · Socket.io · MediaPipe',
+      voice:
+        'An admin authors an exam and shares one link. The candidate sits it under camera, ' +
+        'microphone and browser monitoring. Every violation reaches the admin live. ' +
+        'Marking, timing and storage are all server-side.',
     },
-    6200
+    1200
   );
 }
 
@@ -323,6 +452,14 @@ async function sceneCreateExam(stage) {
   const first = blocks.nth(0);
   await stage.type(first.locator('textarea'), EXAM.questions[0].text, { delay: 24 });
   for (const [index, letter] of ['A', 'B', 'C', 'D'].entries()) {
+    // A line here covers the keystrokes, which would otherwise be dead air.
+    if (index === 1) {
+      await stage.say(
+        'Four options per question, one of them correct.',
+        'Everything is validated again on the server, so a crafted request cannot save a broken exam.',
+        { hold: 0 }
+      );
+    }
     await stage.type(first.getByLabel(`Option ${letter}`), EXAM.questions[0].options[index], {
       delay: 20,
       settle: 120,
@@ -548,6 +685,14 @@ async function sceneExam(stage) {
       });
       await stage.unspot();
     }
+    if (i === 2) {
+      // Covers the rest of the answering loop, which is otherwise silent.
+      await stage.say(
+        'Each save is checked against this attempt.',
+        'A question id from another exam, or an option out of range, is rejected — and a save after time is up returns 409.',
+        { hold: 0 }
+      );
+    }
     await stage.click(page.getByRole('button', { name: /^next$/i }), { settle: 420, duration: 460 });
   }
 
@@ -596,6 +741,11 @@ async function sceneViolations(stage, wasFullscreen) {
   // native tab switch cannot be driven here. We fire the real `blur` event the
   // app already listens for; from the app's side this is an ordinary focus loss.
   await page.evaluate(() => window.dispatchEvent(new Event('blur')));
+  await stage.say(
+    'The report goes out over the socket first.',
+    'If the socket is down it falls back to a REST call, so an event is never lost.',
+    { hold: 0 }
+  );
   const gotTab = await waitForEvent('TAB_SWITCH');
   log(`TAB_SWITCH recorded: ${gotTab}`);
 
@@ -733,6 +883,11 @@ async function sceneLiveMonitoring(stage, examId, extras, warmup) {
     'The detector needs six continuous seconds of no face before it raises anything.',
     { tone: 'warn', hold: 3600 }
   );
+  await stage.say(
+    'Admins only ever see their own exams.',
+    'Subscribing to a room is an ownership check on the server, not a client-side filter.',
+    { hold: 0 }
+  );
   const gotNoFace = await extras.empty.waitForViolation('NO_FACE');
   log(`off-camera candidate raised NO_FACE: ${gotNoFace}`);
 
@@ -751,6 +906,11 @@ async function sceneLiveMonitoring(stage, examId, extras, warmup) {
   });
   await extras.crowd.start();
   await extras.crowd.answerSome(1);
+  await stage.say(
+    'Two faces only needs two and a half seconds.',
+    'A second person on camera is a stronger signal than a candidate glancing away, so it is graded HIGH.',
+    { hold: 0 }
+  );
   const gotMultiple = await extras.crowd.waitForViolation('MULTIPLE_FACES');
   log(`off-camera candidate raised MULTIPLE_FACES: ${gotMultiple}`);
 
@@ -865,10 +1025,15 @@ async function sceneWrap(stage) {
         'Socket.io delivery to the admin, with a REST fallback',
         'Scoped session tokens: candidates get no admin access and no answer key',
       ],
-      footer: 'Recorded locally against MongoDB. Synthetic camera and microphone; everything else is the real app.',
+      footer: 'Arshpreet Singh · arshpreet.singh.dev@gmail.com',
+      voice:
+        'That was the whole product. Exam authoring, server-side marking, on-device detection, ' +
+        'and live delivery to the admin. ' +
+        "Thanks for watching. I'm Arshpreet Singh, and my email is on screen.",
     },
-    7000
+    2500
   );
+  await stage.beat(1500); // let the last line breathe before recording stops
 }
 
 /* -------------------------------------------------------------------------- */
@@ -878,8 +1043,28 @@ async function sceneWrap(stage) {
 async function main() {
   await preflight();
 
+  const release = keepAwake();
+  process.once('exit', release);
+
   fs.mkdirSync(OUT, { recursive: true });
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'proctora-demo-'));
+
+  // Narration is rendered before the browser starts so the director can hold
+  // each caption for exactly as long as its line takes to speak.
+  const narrator = new Narrator({
+    dir: path.join(OUT, '.voice-cache'),
+    voice: VOICE,
+    rate: Number(process.env.DEMO_VOICE_RATE ?? 0),
+    rateScale: VOICE_SCALE,
+  });
+  const warmed = narrator.prewarm();
+  log(
+    `narration: voice=${VOICE} (${narrator.voiceName}) · scale=${VOICE_SCALE} · ` +
+      `${warmed} line(s) rendered up front`
+  );
+  if (demoSpeed !== 1) {
+    log('NOTE: DEMO_SPEED is not 1, so caption holds are shortened and narration will overlap.');
+  }
 
   log('rendering synthetic camera clips…');
   const painter = await chromium.launch({ headless: true });
@@ -922,7 +1107,7 @@ async function main() {
   page.on('dialog', (dialog) => dialog.accept().catch(() => {}));
   page.on('pageerror', (error) => console.error('  [page error]', error.message));
 
-  const stage = new Stage(page, { startedAt });
+  const stage = new Stage(page, { startedAt, narrator, pauseMs: PAUSE_MS });
   await stage.prime();
 
   const extras = {};
@@ -930,6 +1115,7 @@ async function main() {
   let recordedMs = 0;
 
   try {
+    await scene('intro', () => sceneIntro(stage));
     await scene('title', () => sceneTitle(stage));
     await scene('admin login', () => sceneAdminLogin(stage));
     await scene('dashboard', () => sceneDashboard(stage));
@@ -981,24 +1167,27 @@ async function main() {
     process.exit(1);
   }
 
-  const silent = path.join(OUT, 'proctora-demo-silent.webm');
+  const silent = path.join(OUT, `${OUT_NAME}-silent.webm`);
   fs.copyFileSync(videoPath, silent);
 
   /* --------------------------- narration track --------------------------- */
   const produced = [silent];
   let narrationNote = 'no narration produced';
   try {
-    log(`synthesising ${stage.cues.length} narration cues…`);
-    const { cues: spoken, voiceName } = synthesizeCues(stage.cues, path.join(OUT, '.voice-cache'));
-    const wav = path.join(OUT, 'narration.wav');
-    const mixed = mixNarration(spoken, recordedMs, wav);
+    narrator.persist();
+    const wav = path.join(OUT, `${OUT_NAME}-narration.wav`);
+    const mixed = mixNarration(stage.cues, recordedMs, wav);
     produced.push(wav);
-    log(`voice: ${voiceName} · ${spoken.length} lines · ${mixed.clipped} trimmed to fit`);
+    log(
+      `voice: ${narrator.voiceName} · ${stage.cues.length} lines · ` +
+        `${narrator.misses} rendered during the run · ${mixed.overlaps} overlapping`
+    );
+    reportPacing(stage.cues, recordedMs, mixed.spokenMs);
 
     const ffmpeg = findFfmpeg();
     if (ffmpeg) {
       log(`muxing with ${ffmpeg}`);
-      const webm = path.join(OUT, 'proctora-demo.webm');
+      const webm = path.join(OUT, `${OUT_NAME}.webm`);
       run(ffmpeg, [
         '-y', '-hide_banner', '-loglevel', 'error',
         '-i', videoPath,
@@ -1010,7 +1199,7 @@ async function main() {
       produced.push(webm);
 
       if (process.env.DEMO_MP4 !== 'false') {
-        const mp4 = path.join(OUT, 'proctora-demo.mp4');
+        const mp4 = path.join(OUT, `${OUT_NAME}.mp4`);
         log('encoding mp4 (h.264 + aac) — this is the slow step');
         run(ffmpeg, [
           '-y', '-hide_banner', '-loglevel', 'error',
@@ -1023,7 +1212,7 @@ async function main() {
         ]);
         produced.push(mp4);
       }
-      narrationNote = `narrated with ${voiceName}`;
+      narrationNote = `narrated with ${narrator.voiceName}`;
     } else {
       narrationNote =
         'narration.wav written, but ffmpeg was not found so it could not be muxed.\n' +
@@ -1036,8 +1225,9 @@ async function main() {
   }
 
   const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-  const primary = produced.findLast((file) => file.endsWith('.mp4') || file.endsWith('proctora-demo.webm')) ?? silent;
-  const archive = path.join(OUT, `proctora-demo-${stamp}${path.extname(primary)}`);
+  const primary =
+    produced.findLast((file) => file.endsWith('.mp4') || file.endsWith(`${OUT_NAME}.webm`)) ?? silent;
+  const archive = path.join(OUT, `${OUT_NAME}-${stamp}${path.extname(primary)}`);
   fs.copyFileSync(primary, archive);
   fs.rmSync(workDir, { recursive: true, force: true });
 
@@ -1070,6 +1260,7 @@ async function main() {
   console.log(` ${archive}   (archived copy of this run)`);
   console.log(` ${VIEW.width}x${VIEW.height} · ${mb} MB · ${narrationNote}`);
   console.log('────────────────────────────────────────────────\n');
+  release();
 }
 
 main().catch(async (error) => {
